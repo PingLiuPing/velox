@@ -88,6 +88,16 @@ target_link_libraries(
   velox_exec_test_lib
   velox_expression_test_utility)
 
+add_library(velox_topn_row_number_fuzzer TopNRowNumberFuzzer.cpp)
+
+target_link_libraries(
+  velox_topn_row_number_fuzzer
+  velox_fuzzer_util
+  velox_type
+  velox_vector_fuzzer
+  velox_exec_test_lib
+  velox_expression_test_utility)
+
 add_library(velox_join_fuzzer JoinFuzzer.cpp)
 
 target_link_libraries(

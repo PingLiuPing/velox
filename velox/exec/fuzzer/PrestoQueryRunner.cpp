@@ -183,6 +183,11 @@ std::optional<std::string> PrestoQueryRunner::toSql(
     return toSql(rowNumberNode);
   }
 
+  if (const auto rowNumberNode =
+          std::dynamic_pointer_cast<const core::TopNRowNumberNode>(plan)) {
+    return toSql(rowNumberNode);
+  }
+
   if (auto tableWriteNode =
           std::dynamic_pointer_cast<const core::TableWriteNode>(plan)) {
     return toSql(tableWriteNode);
@@ -476,6 +481,51 @@ std::optional<std::string> PrestoQueryRunner::toSql(
 
   sql << ") as row_number FROM tmp";
 
+  return sql.str();
+}
+
+std::optional<std::string> PrestoQueryRunner::toSql(
+    const std::shared_ptr<const core::TopNRowNumberNode>& rowNumberNode) {
+  if (!isSupportedDwrfType(rowNumberNode->sources()[0]->outputType())) {
+    return std::nullopt;
+  }
+
+  std::stringstream sql;
+  sql << "SELECT * FROM (SELECT ";
+
+  const auto& inputType = rowNumberNode->sources()[0]->outputType();
+  for (auto i = 0; i < inputType->size(); ++i) {
+    appendComma(i, sql);
+    sql << inputType->nameOf(i);
+  }
+
+  sql << ", row_number() OVER (";
+
+  const auto& partitionKeys = rowNumberNode->partitionKeys();
+  if (!partitionKeys.empty()) {
+    sql << "partition by ";
+    for (auto i = 0; i < partitionKeys.size(); ++i) {
+      appendComma(i, sql);
+      sql << partitionKeys[i]->name();
+    }
+  }
+
+  const auto& sortingKeys = rowNumberNode->sortingKeys();
+  const auto& sortingOrders = rowNumberNode->sortingOrders();
+
+  if (!sortingKeys.empty()) {
+    sql << " ORDER BY ";
+    for (auto j = 0; j < sortingKeys.size(); ++j) {
+      appendComma(j, sql);
+      sql << sortingKeys[j]->name() << " " << sortingOrders[j].toString();
+    }
+  }
+
+  sql << ") as row_number FROM tmp)";
+
+  sql << " where row_number <= " << rowNumberNode->limit();
+
+  LOG(INFO) << "PrestoSQL generated " << sql.str();
   return sql.str();
 }
 

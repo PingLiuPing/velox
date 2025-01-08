@@ -220,6 +220,13 @@ target_link_libraries(
   velox_row_number_fuzzer_test velox_row_number_fuzzer GTest::gtest
   GTest::gtest_main)
 
+# TopNRowNumber Fuzzer.
+add_executable(velox_topn_row_number_fuzzer_test TopNRowNumberFuzzerTest.cpp)
+
+target_link_libraries(
+  velox_topn_row_number_fuzzer_test velox_topn_row_number_fuzzer GTest::gtest
+  GTest::gtest_main)
+
 # Join Fuzzer.
 add_executable(velox_join_fuzzer_test JoinFuzzerTest.cpp)
 
