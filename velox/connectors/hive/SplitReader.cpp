@@ -16,6 +16,8 @@
 
 #include "velox/connectors/hive/SplitReader.h"
 
+#include <common/encode/Base64.h>
+
 #include "velox/common/caching/CacheTTLController.h"
 #include "velox/connectors/hive/HiveConfig.h"
 #include "velox/connectors/hive/HiveConnectorSplit.h"
@@ -57,8 +59,22 @@ VectorPtr newConstantFromString(
   }
 
   if constexpr (std::is_same_v<T, StringView>) {
-    return std::make_shared<ConstantVector<StringView>>(
-        pool, size, false, type, StringView(value.value()));
+    if (type->isVarbinary()) {
+      std::string decodedValue = encoding::Base64::decode(value.value());
+      return std::make_shared<ConstantVector<StringView>>(
+        pool, size, false, type, StringView(decodedValue));
+    } else {
+      return std::make_shared<ConstantVector<StringView>>(
+          pool, size, false, type, StringView(value.value()));
+    }
+  } else if (type->isShortDecimal()) {
+    const auto [p, s] = getDecimalPrecisionScale(*type);
+    auto copy = velox::util::Converter<TypeKind::BIGINT>::tryCast(value.value(), s)
+                .thenOrThrow(folly::identity, [&](const Status& status) {
+                  VELOX_USER_FAIL("{}", status.message());
+                });
+    return std::make_shared<ConstantVector<int64_t>>(
+        pool, size, false, type, std::move(copy));
   } else {
     auto copy = velox::util::Converter<kind>::tryCast(value.value())
                     .thenOrThrow(folly::identity, [&](const Status& status) {

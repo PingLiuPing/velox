@@ -345,6 +345,81 @@ struct Converter<
     }
   }
 
+  static Expected<T> tryCast(const std::string& v, const int32_t targetScale) {
+    const auto trimmed = trimWhiteSpace(v.data(), v.length());
+    const int len = trimmed.size();
+    if (len == 0) {
+      return folly::makeUnexpected(Status::UserError("Cannot cast an empty string to an integral value."));
+    }
+
+    bool negative = false;
+    int index = 0;
+
+    if (trimmed[0] == '-' || trimmed[0] == '+') {
+      negative = (trimmed[0] == '-');
+      index++;
+      if (index == len) {
+        return folly::makeUnexpected(Status::UserError("String contains only a sign, no digits."));
+      }
+    }
+
+    T integerPart = 0;
+    T fractionPart = 0;
+    int fractionDigits = 0;
+    bool seenDecimal = false;
+
+    // Process each character.
+    for (; index < len; index++) {
+      char c = trimmed[index];
+      if (c == '.') {
+        if (seenDecimal) {
+          return folly::makeUnexpected(Status::UserError("Multiple decimal points encountered."));
+        }
+        seenDecimal = true;
+      } else if (std::isdigit(c)) {
+        int digit = c - '0';
+        if (!seenDecimal) {
+          integerPart = checkedMultiply<T>(integerPart, 10, CppToType<T>::name);
+          integerPart = checkedPlus<T>(integerPart, digit, CppToType<T>::name);
+        } else {
+          // Only accumulate as many fractional digits as needed.
+          if (fractionDigits < targetScale) {
+            fractionPart = checkedMultiply<T>(fractionPart, 10, CppToType<T>::name);
+            fractionPart = checkedPlus<T>(fractionPart, digit, CppToType<T>::name);
+          }
+          fractionDigits++;
+        }
+      } else {
+        return folly::makeUnexpected(Status::UserError("Encountered a non-digit character."));
+      }
+    }
+    // If the fractional part has fewer digits than targetScale,
+    // multiply fractionPart by 10^(targetScale - fractionDigits).
+    if (fractionDigits < targetScale) {
+      int missing = targetScale - fractionDigits;
+      for (int i = 0; i < missing; i++) {
+        fractionPart = checkedMultiply<T>(fractionPart, 10, CppToType<T>::name);
+      }
+    }
+    // If there are more fractional digits than targetScale,
+    // we simply truncate the extra digits.
+
+    // Calculate multiplier for the integer part: 10^(targetScale).
+    T multiplier = 1;
+    for (int i = 0; i < targetScale; i++) {
+      multiplier = checkedMultiply<T>(multiplier, 10, CppToType<T>::name);
+    }
+
+    // Combine the integer and fractional parts.
+    T result = checkedMultiply<T>(integerPart, multiplier, CppToType<T>::name);
+    result = checkedPlus<T>(result, fractionPart, CppToType<T>::name);
+
+    if (negative) {
+      result = -result;
+    }
+    return result;
+  }
+
   static Expected<T> tryCast(const bool& v) {
     return folly::to<T>(v);
   }
