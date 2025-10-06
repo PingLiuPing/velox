@@ -709,6 +709,11 @@ Each query can override the config by setting corresponding query session proper
      - bool
      - false
      - Whether to preserve flat maps in memory as FlatMapVectors instead of converting them to MapVectors. This is only applied during data reading inside the DWRF and Nimble readers, not during downstream processing like expression evaluation etc.
+   * - fanout-enabled
+     - fanout_enabled
+     - bool
+     - true
+     - Controls the writer mode, whether the fanout mode writer is enabled, default value is true, setting to false means clustered mode. Currently applies only to the Iceberg writer.
 
 ``ORC File Format Configuration``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -902,6 +907,22 @@ Each query can override the config by setting corresponding query session proper
      -
      - A custom credential provider, if specified, will be used to create the client in favor of other authentication mechanisms.
        The provider must be registered using "registerAWSCredentialsProvider" before it can be used.
+   * - hive.s3.part-upload-async
+     - bool
+     - false
+     - If true, enables asynchronous upload of parts for S3 multipart uploads.
+   * - hive.s3.part-upload-size
+     - integer
+     - 10485760
+     - Specifies the size (in bytes) of each part for S3 multipart uploads.
+   * - hive.s3.max-concurrent-upload-num
+     - integer
+     - 4
+     - Specifies the maximum number of concurrent uploads for S3 multipart uploads.
+   * - hive.s3.upload-threads
+     - integer
+     - 16
+     - Specifies the number of threads to use for S3 multipart uploads.
 
 Bucket Level Configuration
 """"""""""""""""""""""""""
