@@ -992,22 +992,6 @@ TypePtr ReaderBase::convertType(
             requestedType->toString());
         return TIME();
 
-      case thrift::ConvertedType::TIME_MICROS:
-        VELOX_CHECK_EQ(
-            schemaElement.type,
-            thrift::Type::INT64,
-            "TIME_MICROS converted type can only be set for value of thrift::Type::INT64");
-        VELOX_CHECK(
-            !requestedType ||
-                isCompatible(
-                    requestedType,
-                    isRepeated,
-                    [](const TypePtr& type) { return type->isTime(); }),
-            kTypeMappingErrorFmtStr,
-            "TIME",
-            requestedType->toString());
-        return TIME();
-
       case thrift::ConvertedType::MAP:
       case thrift::ConvertedType::MAP_KEY_VALUE:
       case thrift::ConvertedType::LIST:
