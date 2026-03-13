@@ -521,8 +521,11 @@ struct HiveWriterIdEq {
   }
 };
 
+class PartitionWriter;
+
 class HiveDataSink : public DataSink {
  public:
+  ~HiveDataSink() override;
   /// The list of runtime stats reported by hive data sink
   static constexpr const char* kEarlyFlushedRawBytes = "earlyFlushedRawBytes";
 
@@ -686,23 +689,9 @@ class HiveDataSink : public DataSink {
   // Compute the partition id and bucket id for each row in 'input'.
   virtual void computePartitionAndBucketIds(const RowVectorPtr& input);
 
-  // Get the HiveWriter corresponding to the row
-  // from partitionIds and bucketIds.
-  HiveWriterId getWriterId(size_t row) const;
-
-  // Computes the number of input rows as well as the actual input row indices
-  // to each corresponding (bucketed) partition based on the partition and
-  // bucket ids calculated by 'computePartitionAndBucketIds'. The function also
-  // ensures that there is a writer created for each (bucketed) partition.
-  void splitInputRowsAndEnsureWriters();
-
-  // Makes sure to create one writer for the given writer id. The function
-  // returns the corresponding index in 'writers_'.
-  virtual uint32_t ensureWriter(const HiveWriterId& id);
-
-  // Appends a new writer for the given 'id'. The function returns the index of
-  // the newly created writer in 'writers_'.
-  uint32_t appendWriter(const HiveWriterId& id);
+  // Creates a RotationWriter for the given writer ID. Called by the
+  // PartitionWriter's WriterFactory to create new writers on demand.
+  std::unique_ptr<RotationWriter> createRotationWriter(const HiveWriterId& id);
 
   // Creates a format writer (optionally wrapped in SortingWriter) for the
   // given writer info and IO stats. Updates file names based on the current
@@ -728,14 +717,6 @@ class HiveDataSink : public DataSink {
       HiveWriterInfo* writerInfo,
       std::unique_ptr<facebook::velox::dwio::common::Writer> writer);
 
-  // Records a row index for a specific partition. This method maintains the
-  // mapping of which input rows belong to which partition by storing row
-  // indices in partition-specific buffers. If the buffer for the partition
-  // doesn't exist or is too small, it allocates/reallocates the buffer to
-  // accommodate all rows.
-  void
-  updatePartitionRows(uint32_t index, vector_size_t numRows, vector_size_t row);
-
   HiveWriterParameters getWriterParameters(
       const std::optional<std::string>& partition,
       std::optional<uint32_t> bucketId) const;
@@ -755,9 +736,6 @@ class HiveDataSink : public DataSink {
   FOLLY_ALWAYS_INLINE void checkRunning() const {
     VELOX_CHECK_EQ(state_, State::kRunning, "Hive data sink is not running");
   }
-
-  // Invoked to write 'input' to the specified RotationWriter.
-  void write(size_t index, RowVectorPtr input);
 
   void closeInternal();
 
@@ -790,21 +768,12 @@ class HiveDataSink : public DataSink {
 
   tsan_atomic<bool> nonReclaimableSection_{false};
 
-  // The map from writer id to the writer index in 'writers_'.
-  folly::F14FastMap<HiveWriterId, uint32_t, HiveWriterIdHasher, HiveWriterIdEq>
-      writerIndexMap_;
-
-  // Per-partition (or per-partition+bucket) writers. Each RotationWriter owns
-  // its HiveWriterInfo and IoStatistics, and handles file size-based rotation.
-  std::vector<std::unique_ptr<RotationWriter>> writers_;
+  // Routes rows to writers by partition/bucket and owns the RotationWriters.
+  std::unique_ptr<PartitionWriter> partitionWriter_;
 
   // Below are structures updated when processing current input. partitionIds_
-  // are indexed by the row of input_. partitionRows_, rawPartitionRows_ and
-  // partitionSizes_ are indexed by partitionId.
+  // are indexed by the row of input_.
   raw_vector<uint64_t> partitionIds_;
-  std::vector<BufferPtr> partitionRows_;
-  std::vector<vector_size_t*> rawPartitionRows_;
-  std::vector<vector_size_t> partitionSizes_;
 
   // Reusable buffers for bucket id calculations.
   std::vector<uint32_t> bucketIds_;

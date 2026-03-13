@@ -16,6 +16,8 @@
 
 #include "velox/connectors/hive/iceberg/IcebergDataSink.h"
 
+#include "velox/connectors/hive/PartitionWriter.h"
+
 #include <boost/lexical_cast.hpp>
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
@@ -304,18 +306,28 @@ IcebergDataSink::IcebergDataSink(
               : nullptr),
       partitionRowType_(std::move(partitionRowType)) {
   commitPartitionValue_.resize(maxOpenWriters_);
+  if (isPartitioned()) {
+    partitionWriter_->setOnWriterCreated(
+        [this](uint32_t writerIndex, const HiveWriterId& /*id*/) {
+          if (commitPartitionValue_[writerIndex].isNull()) {
+            commitPartitionValue_[writerIndex] =
+                makeCommitPartitionValue(writerIndex);
+          }
+        });
+  }
 }
 
 std::vector<std::string> IcebergDataSink::commitMessage() const {
+  const auto& writers = partitionWriter_->writers();
   std::vector<std::string> commitTasks;
-  commitTasks.reserve(writers_.size());
+  commitTasks.reserve(writers.size());
 
   auto icebergInsertTableHandle =
       std::dynamic_pointer_cast<const IcebergInsertTableHandle>(
           insertTableHandle_);
 
-  for (size_t i = 0; i < writers_.size(); ++i) {
-    const auto& writerInfo = writers_.at(i)->writerInfo();
+  for (size_t i = 0; i < writers.size(); ++i) {
+    const auto& writerInfo = writers.at(i)->writerInfo();
     VELOX_CHECK_NOT_NULL(writerInfo);
 
     // Following metadata (json format) is consumed by Presto CommitTaskData.
@@ -373,14 +385,6 @@ std::string IcebergDataSink::getPartitionName(uint32_t partitionId) const {
       partitionId,
       partitionIdGenerator_->partitionValues(),
       partitionKeyAsLowerCase_);
-}
-
-uint32_t IcebergDataSink::ensureWriter(const HiveWriterId& id) {
-  auto writerId = HiveDataSink::ensureWriter(id);
-  if (commitPartitionValue_[writerId].isNull()) {
-    commitPartitionValue_[writerId] = makeCommitPartitionValue(writerId);
-  }
-  return writerId;
 }
 
 std::shared_ptr<dwio::common::WriterOptions>

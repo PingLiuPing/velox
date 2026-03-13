@@ -33,6 +33,7 @@ velox_add_library(
   HiveIndexSource.cpp
   HivePartitionName.cpp
   PartitionIdGenerator.cpp
+  PartitionWriter.cpp
   RotationWriter.cpp
   SplitReader.cpp
   TableHandle.cpp
