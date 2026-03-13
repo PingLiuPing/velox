@@ -308,14 +308,14 @@ IcebergDataSink::IcebergDataSink(
 
 std::vector<std::string> IcebergDataSink::commitMessage() const {
   std::vector<std::string> commitTasks;
-  commitTasks.reserve(writerInfo_.size());
+  commitTasks.reserve(writers_.size());
 
   auto icebergInsertTableHandle =
       std::dynamic_pointer_cast<const IcebergInsertTableHandle>(
           insertTableHandle_);
 
-  for (auto i = 0; i < writerInfo_.size(); ++i) {
-    const auto& writerInfo = writerInfo_.at(i);
+  for (size_t i = 0; i < writers_.size(); ++i) {
+    const auto& writerInfo = writers_.at(i)->writerInfo();
     VELOX_CHECK_NOT_NULL(writerInfo);
 
     // Following metadata (json format) is consumed by Presto CommitTaskData.
@@ -384,8 +384,8 @@ uint32_t IcebergDataSink::ensureWriter(const HiveWriterId& id) {
 }
 
 std::shared_ptr<dwio::common::WriterOptions>
-IcebergDataSink::createWriterOptions() const {
-  auto options = HiveDataSink::createWriterOptions();
+IcebergDataSink::createWriterOptions(const HiveWriterInfo* writerInfo) const {
+  auto options = HiveDataSink::createWriterOptions(writerInfo);
   // Per Iceberg specification (https://iceberg.apache.org/spec/#parquet):
   // - Timestamps must be stored with microsecond precision.
   // - Timestamps must NOT be adjusted to UTC timezone; they should be written

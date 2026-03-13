@@ -20,6 +20,7 @@
 #include "velox/connectors/hive/HiveConfig.h"
 #include "velox/connectors/hive/HivePartitionName.h"
 #include "velox/connectors/hive/PartitionIdGenerator.h"
+#include "velox/connectors/hive/RotationWriter.h"
 #include "velox/connectors/hive/TableHandle.h"
 #include "velox/dwio/common/Options.h"
 #include "velox/dwio/common/Writer.h"
@@ -682,12 +683,6 @@ class HiveDataSink : public DataSink {
       HiveWriterInfo* writerInfo,
       io::IoStatistics* ioStats);
 
-  // Returns the bytes written to the current file for the specified writer.
-  // This is calculated as total bytes minus cumulative bytes from rotated
-  // files. Use this instead of rawBytesWritten() when you need current file
-  // size.
-  uint64_t getCurrentFileBytes(size_t writerIndex) const;
-
   // Compute the partition id and bucket id for each row in 'input'.
   virtual void computePartitionAndBucketIds(const RowVectorPtr& input);
 
@@ -709,22 +704,18 @@ class HiveDataSink : public DataSink {
   // the newly created writer in 'writers_'.
   uint32_t appendWriter(const HiveWriterId& id);
 
-  // Creates a writer for the given index using the current file sequence.
-  std::unique_ptr<facebook::velox::dwio::common::Writer> createWriterForIndex(
-      size_t writerIndex);
+  // Creates a format writer (optionally wrapped in SortingWriter) for the
+  // given writer info and IO stats. Updates file names based on the current
+  // file sequence number.
+  std::unique_ptr<facebook::velox::dwio::common::Writer> createFormatWriter(
+      HiveWriterInfo* writerInfo,
+      io::IoStatistics* ioStats);
 
   // Creates and configures WriterOptions based on file format.
   // Sets up compression, schema, and other writer configuration based on the
   // insert table handle and connector settings.
-  // The no-argument overload uses the last writer's info (for appendWriter).
-  virtual std::shared_ptr<dwio::common::WriterOptions> createWriterOptions()
-      const;
-
-  // Creates WriterOptions for a specific writer index. Use this overload
-  // during writer rotation to ensure the correct writer's memory pool and
-  // nonReclaimableSection are used.
-  std::shared_ptr<dwio::common::WriterOptions> createWriterOptions(
-      size_t writerIndex) const;
+  virtual std::shared_ptr<dwio::common::WriterOptions> createWriterOptions(
+      const HiveWriterInfo* writerInfo) const;
 
   // Returns the Hive partition directory name for the given partition ID.
   // Converts the partition values associated with the partition ID into a
@@ -734,7 +725,7 @@ class HiveDataSink : public DataSink {
 
   std::unique_ptr<facebook::velox::dwio::common::Writer>
   maybeCreateBucketSortWriter(
-      size_t writerIndex,
+      HiveWriterInfo* writerInfo,
       std::unique_ptr<facebook::velox::dwio::common::Writer> writer);
 
   // Records a row index for a specific partition. This method maintains the
@@ -765,28 +756,12 @@ class HiveDataSink : public DataSink {
     VELOX_CHECK_EQ(state_, State::kRunning, "Hive data sink is not running");
   }
 
-  // Invoked to write 'input' to the specified file writer.
+  // Invoked to write 'input' to the specified RotationWriter.
   void write(size_t index, RowVectorPtr input);
-
-  /// Rotates the writer at the given index to a new file. This is called when
-  /// the current file exceeds maxTargetFileBytes_. The old writer is closed
-  /// and a new writer is created for the same partition/bucket.
-  void rotateWriter(size_t index);
-
-  /// Finalizes the current file for the writer at the given index.
-  /// Captures file stats and adds the file info to writtenFiles.
-  /// Called by rotateWriter() and closeInternal().
-  void finalizeWriterFile(size_t index);
 
   void closeInternal();
 
-  // IMPORTANT NOTE: these are passed to writers as raw pointers. HiveDataSink
-  // owns the lifetime of these objects, and therefore must destroy them last.
-  // Additionally, we must assume that no objects which hold a reference to
-  // these stats will outlive the HiveDataSink instance. This is a reasonable
-  // assumption given the semantics of these stats objects.
-  std::vector<std::unique_ptr<io::IoStatistics>> ioStats_;
-  // Generic filesystem stats, exposed as RuntimeStats
+  // Generic filesystem stats, exposed as RuntimeStats.
   std::unique_ptr<IoStats> fileSystemStats_;
 
   const RowTypePtr inputType_;
@@ -815,14 +790,13 @@ class HiveDataSink : public DataSink {
 
   tsan_atomic<bool> nonReclaimableSection_{false};
 
-  // The map from writer id to the writer index in 'writers_' and 'writerInfo_'.
+  // The map from writer id to the writer index in 'writers_'.
   folly::F14FastMap<HiveWriterId, uint32_t, HiveWriterIdHasher, HiveWriterIdEq>
       writerIndexMap_;
 
-  // Below are structures for partitions from all inputs. writerInfo_ and
-  // writers_ are both indexed by partitionId.
-  std::vector<std::shared_ptr<HiveWriterInfo>> writerInfo_;
-  std::vector<std::unique_ptr<dwio::common::Writer>> writers_;
+  // Per-partition (or per-partition+bucket) writers. Each RotationWriter owns
+  // its HiveWriterInfo and IoStatistics, and handles file size-based rotation.
+  std::vector<std::unique_ptr<RotationWriter>> writers_;
 
   // Below are structures updated when processing current input. partitionIds_
   // are indexed by the row of input_. partitionRows_, rawPartitionRows_ and

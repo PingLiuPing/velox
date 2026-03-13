@@ -38,9 +38,6 @@ using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::connector::hive {
 namespace {
-#define WRITER_NON_RECLAIMABLE_SECTION_GUARD(index)       \
-  memory::NonReclaimableSectionGuard nonReclaimableGuard( \
-      writerInfo_[(index)]->nonReclaimableSectionHolder.get())
 
 // Appends a sequence number to a filename for file rotation.
 // Returns the original filename if sequenceNumber is 0 (no rotation yet).
@@ -616,88 +613,10 @@ void HiveDataSink::appendData(RowVectorPtr input) {
 }
 
 void HiveDataSink::write(size_t index, RowVectorPtr input) {
-  WRITER_NON_RECLAIMABLE_SECTION_GUARD(index);
   auto dataInput = makeDataInput(dataChannels_, input);
-
-  if (writers_[index] == nullptr) {
-    writers_[index] = createWriterForIndex(index);
-  }
-
   writers_[index]->write(dataInput);
-  writerInfo_[index]->inputSizeInBytes += dataInput->estimateFlatSize();
-  writerInfo_[index]->numWrittenRows += dataInput->size();
-  writerInfo_[index]->currentFileWrittenRows += dataInput->size();
-
-  // File rotation is not supported for bucketed tables (require one file per
-  // bucket with predictable name) or sorted writes (SortingWriter not
-  // recreated).
-  if (maxTargetFileBytes_ == 0 || isBucketed() || sortWrite()) {
-    return;
-  }
-
-  const auto currentFileBytes = getCurrentFileBytes(index);
-  if (currentFileBytes >= maxTargetFileBytes_) {
-    rotateWriter(index);
-  }
-}
-
-uint64_t HiveDataSink::getCurrentFileBytes(size_t writerIndex) const {
-  VELOX_CHECK_LT(writerIndex, ioStats_.size());
-  VELOX_CHECK_LT(writerIndex, writerInfo_.size());
-  const auto totalBytes = ioStats_[writerIndex]->rawBytesWritten();
-  const auto baselineBytes = writerInfo_[writerIndex]->cumulativeWrittenBytes;
-  // Sanity check: total should always be >= baseline since ioStats is
-  // never reset and cumulative is a snapshot of rawBytesWritten at rotation.
-  VELOX_DCHECK_GE(totalBytes, baselineBytes);
-  return totalBytes - baselineBytes;
-}
-
-void HiveDataSink::finalizeWriterFile(size_t index) {
-  VELOX_CHECK_LT(index, writerInfo_.size());
-  VELOX_CHECK_LT(index, ioStats_.size());
-
-  auto& info = writerInfo_[index];
-
-  // Capture current file stats AFTER close to include footer bytes.
-  const auto currentFileBytes = getCurrentFileBytes(index);
-
-  // Finalize the current file into writtenFiles using the stored names.
-  if (currentFileBytes > 0) {
-    HiveFileInfo fileInfo;
-    fileInfo.writeFileName = info->currentWriteFileName;
-    fileInfo.targetFileName = info->currentTargetFileName;
-    fileInfo.fileSize = currentFileBytes;
-    fileInfo.numRows = info->currentFileWrittenRows;
-    // Reset for next file.
-    info->currentFileWrittenRows = 0;
-    info->writtenFiles.push_back(std::move(fileInfo));
-  }
-
-  // Update cumulative stats as a snapshot of total stats so far.
-  // This becomes the baseline for the next file.
-  info->cumulativeWrittenBytes = ioStats_[index]->rawBytesWritten();
-}
-
-// Rotates the current writer to a new file when the file size exceeds the
-// threshold. This enables writing multiple smaller files instead of one large
-// file, which improves downstream read performance and parallel processing.
-void HiveDataSink::rotateWriter(size_t index) {
-  VELOX_CHECK_LT(index, writers_.size());
-  VELOX_CHECK_LT(index, writerInfo_.size());
-
-  auto& info = writerInfo_[index];
-
-  // Close the writer first to flush all data including footer.
-  writers_[index]->close();
-
-  // Finalize the current file state.
-  finalizeWriterFile(index);
-
-  // Release old writer's memory pools. The new writer will be created lazily
-  // on the next write to avoid creating empty files.
-  writers_[index].reset();
-
-  ++info->fileSequenceNumber;
+  writers_[index]->writerInfo()->inputSizeInBytes +=
+      dataInput->estimateFlatSize();
 }
 
 std::string HiveDataSink::stateString(State state) {
@@ -747,9 +666,9 @@ DataSink::Stats HiveDataSink::stats() const {
     return stats;
   }
 
-  for (const auto& ioStats : ioStats_) {
-    stats.numWrittenBytes += ioStats->rawBytesWritten();
-    stats.writeIOTimeUs += ioStats->writeIOTimeUs();
+  for (const auto& writer : writers_) {
+    stats.numWrittenBytes += writer->ioStats()->rawBytesWritten();
+    stats.writeIOTimeUs += writer->ioStats()->writeIOTimeUs();
   }
 
   if (state_ != State::kClosed) {
@@ -758,8 +677,8 @@ DataSink::Stats HiveDataSink::stats() const {
 
   // Count total files written, including rotated files.
   stats.numWrittenFiles = 0;
-  for (size_t i = 0; i < writerInfo_.size(); ++i) {
-    const auto& info = writerInfo_.at(i);
+  for (const auto& writer : writers_) {
+    const auto& info = writer->writerInfo();
     VELOX_CHECK_NOT_NULL(info);
     stats.numWrittenFiles += info->writtenFiles.size();
     if (!info->spillStats->empty()) {
@@ -844,9 +763,8 @@ bool HiveDataSink::finish() {
 
   // TODO: we might refactor to move the data sorting logic into hive data sink.
   const uint64_t startTimeMs = getCurrentTimeMs();
-  for (auto i = 0; i < writers_.size(); ++i) {
-    WRITER_NON_RECLAIMABLE_SECTION_GUARD(i);
-    if (!writers_[i]->finish()) {
+  for (auto& writer : writers_) {
+    if (!writer->finish()) {
       return false;
     }
     if (getCurrentTimeMs() - startTimeMs > sortWriterFinishTimeSliceLimitMs_) {
@@ -864,9 +782,9 @@ std::vector<std::string> HiveDataSink::close() {
 
 std::vector<std::string> HiveDataSink::commitMessage() const {
   std::vector<std::string> partitionUpdates;
-  partitionUpdates.reserve(writerInfo_.size());
-  for (int i = 0; i < writerInfo_.size(); ++i) {
-    const auto& info = writerInfo_.at(i);
+  partitionUpdates.reserve(writers_.size());
+  for (size_t i = 0; i < writers_.size(); ++i) {
+    const auto& info = writers_.at(i)->writerInfo();
     VELOX_CHECK_NOT_NULL(info);
 
     // Build the fileWriteInfos array from all written files.
@@ -890,7 +808,7 @@ std::vector<std::string> HiveDataSink::commitMessage() const {
           ("fileWriteInfos", std::move(fileWriteInfosArray))
           ("rowCount", info->numWrittenRows)
           ("inMemoryDataSizeInBytes", info->inputSizeInBytes)
-          ("onDiskDataSizeInBytes", ioStats_.at(i)->rawBytesWritten())
+          ("onDiskDataSizeInBytes", writers_.at(i)->ioStats()->rawBytesWritten())
           ("containsNumberedFileNames", true));
     // clang-format on
     partitionUpdates.push_back(partitionUpdateJson);
@@ -910,26 +828,15 @@ void HiveDataSink::closeInternal() {
   TestValue::adjust(
       "facebook::velox::connector::hive::HiveDataSink::closeInternal", this);
 
-  // NOTE: writers_[i] can be nullptr during file rotation. In rotateWriter(),
-  // we call writers_[index].reset() to release the old writer before creating
-  // a new one. If an error occurs during new writer creation, or if abort is
-  // called during this window, the writer slot may be empty.
+  // RotationWriter handles null inner writers (during rotation window)
+  // and NonReclaimableSectionGuard internally.
   if (state_ == State::kClosed) {
-    for (int i = 0; i < writers_.size(); ++i) {
-      if (writers_[i] == nullptr) {
-        continue;
-      }
-      WRITER_NON_RECLAIMABLE_SECTION_GUARD(i);
-      writers_[i]->close();
-      finalizeWriterFile(i);
+    for (auto& writer : writers_) {
+      writer->close();
     }
   } else {
-    for (int i = 0; i < writers_.size(); ++i) {
-      if (writers_[i] == nullptr) {
-        continue;
-      }
-      WRITER_NON_RECLAIMABLE_SECTION_GUARD(i);
-      writers_[i]->abort();
+    for (auto& writer : writers_) {
+      writer->abort();
     }
   }
 }
@@ -942,15 +849,9 @@ uint32_t HiveDataSink::ensureWriter(const HiveWriterId& id) {
   return appendWriter(id);
 }
 
-std::shared_ptr<dwio::common::WriterOptions> HiveDataSink::createWriterOptions()
-    const {
-  // Default: use the last writer's info (for appendWriter which just added it)
-  return createWriterOptions(writerInfo_.size() - 1);
-}
-
 std::shared_ptr<dwio::common::WriterOptions> HiveDataSink::createWriterOptions(
-    size_t writerIndex) const {
-  VELOX_CHECK_LT(writerIndex, writerInfo_.size());
+    const HiveWriterInfo* writerInfo) const {
+  VELOX_CHECK_NOT_NULL(writerInfo);
 
   // Take the writer options provided by the user as a starting point, or
   // allocate a new one.
@@ -968,7 +869,7 @@ std::shared_ptr<dwio::common::WriterOptions> HiveDataSink::createWriterOptions(
   }
 
   if (options->memoryPool == nullptr) {
-    options->memoryPool = writerInfo_[writerIndex]->writerPool.get();
+    options->memoryPool = writerInfo->writerPool.get();
   }
 
   if (!options->compressionKind) {
@@ -983,7 +884,7 @@ std::shared_ptr<dwio::common::WriterOptions> HiveDataSink::createWriterOptions(
   // Since insertTableHandle_->writerOptions() returns a shared_ptr, we need
   // to ensure each writer has its own nonReclaimableSection pointer.
   options->nonReclaimableSection =
-      writerInfo_[writerIndex]->nonReclaimableSectionHolder.get();
+      writerInfo->nonReclaimableSectionHolder.get();
 
   if (options->memoryReclaimerFactory == nullptr ||
       options->memoryReclaimerFactory() == nullptr) {
@@ -1009,8 +910,7 @@ uint32_t HiveDataSink::appendWriter(const HiveWriterId& id) {
   // Check max open writers.
   VELOX_USER_CHECK_LE(
       writers_.size(), maxOpenWriters_, "Exceeded open writer limit");
-  VELOX_CHECK_EQ(writers_.size(), writerInfo_.size());
-  VELOX_CHECK_EQ(writerIndexMap_.size(), writerInfo_.size());
+  VELOX_CHECK_EQ(writerIndexMap_.size(), writers_.size());
 
   std::optional<std::string> partitionName;
   if (isPartitioned()) {
@@ -1026,16 +926,32 @@ uint32_t HiveDataSink::appendWriter(const HiveWriterId& id) {
   if (sortWrite()) {
     sortPool = createSortPool(writerPool);
   }
-  writerInfo_.emplace_back(
-      std::make_shared<HiveWriterInfo>(
-          std::move(writerParameters),
-          std::move(writerPool),
-          std::move(sinkPool),
-          std::move(sortPool)));
-  ioStats_.emplace_back(std::make_unique<io::IoStatistics>());
+  auto writerInfo = std::make_shared<HiveWriterInfo>(
+      std::move(writerParameters),
+      std::move(writerPool),
+      std::move(sinkPool),
+      std::move(sortPool));
+  auto ioStats = std::make_unique<io::IoStatistics>();
 
-  setMemoryReclaimers(writerInfo_.back().get(), ioStats_.back().get());
-  writers_.emplace_back(createWriterForIndex(writerInfo_.size() - 1));
+  setMemoryReclaimers(writerInfo.get(), ioStats.get());
+
+  auto formatWriter = createFormatWriter(writerInfo.get(), ioStats.get());
+
+  const bool canRotate = !isBucketed() && !sortWrite();
+  const auto writerIndex = writers_.size();
+  writers_.emplace_back(
+      std::make_unique<RotationWriter>(
+          std::move(formatWriter),
+          writerInfo,
+          std::move(ioStats),
+          maxTargetFileBytes_,
+          canRotate,
+          [this, writerIndex]() {
+            return createFormatWriter(
+                writers_[writerIndex]->writerInfo().get(),
+                writers_[writerIndex]->ioStats());
+          }));
+
   addThreadLocalRuntimeStat(
       fmt::format(
           "{}WriterCount",
@@ -1046,40 +962,42 @@ uint32_t HiveDataSink::appendWriter(const HiveWriterId& id) {
   partitionRows_.emplace_back(nullptr);
   rawPartitionRows_.emplace_back(nullptr);
 
-  writerIndexMap_.emplace(id, writers_.size() - 1);
-  return writerIndexMap_[id];
+  writerIndexMap_.emplace(id, writerIndex);
+  return writerIndex;
 }
 
-std::unique_ptr<dwio::common::Writer> HiveDataSink::createWriterForIndex(
-    size_t writerIndex) {
-  VELOX_CHECK_LT(writerIndex, writerInfo_.size());
-  VELOX_CHECK_LT(writerIndex, ioStats_.size());
+std::unique_ptr<dwio::common::Writer> HiveDataSink::createFormatWriter(
+    HiveWriterInfo* writerInfo,
+    io::IoStatistics* ioStats) {
+  VELOX_CHECK_NOT_NULL(writerInfo);
+  VELOX_CHECK_NOT_NULL(ioStats);
 
-  auto& info = writerInfo_[writerIndex];
-  const auto& params = info->writerParameters;
+  const auto& params = writerInfo->writerParameters;
 
   // Compute and store the new file names.
-  info->currentWriteFileName =
-      makeSequencedFileName(params.writeFileName(), info->fileSequenceNumber);
-  info->currentTargetFileName =
-      makeSequencedFileName(params.targetFileName(), info->fileSequenceNumber);
+  writerInfo->currentWriteFileName = makeSequencedFileName(
+      params.writeFileName(), writerInfo->fileSequenceNumber);
+  writerInfo->currentTargetFileName = makeSequencedFileName(
+      params.targetFileName(), writerInfo->fileSequenceNumber);
 
   const auto writePath =
-      (fs::path(params.writeDirectory()) / info->currentWriteFileName).string();
+      (fs::path(params.writeDirectory()) / writerInfo->currentWriteFileName)
+          .string();
 
-  auto options = createWriterOptions(writerIndex);
+  auto options = createWriterOptions(writerInfo);
 
   // Prevents the memory allocation during the writer creation.
-  WRITER_NON_RECLAIMABLE_SECTION_GUARD(writerIndex);
+  memory::NonReclaimableSectionGuard nonReclaimableGuard(
+      writerInfo->nonReclaimableSectionHolder.get());
   auto writer = writerFactory_->createWriter(
       createHiveFileSink(
           writePath,
           hiveConfig_,
-          info->sinkPool.get(),
-          ioStats_[writerIndex].get(),
+          writerInfo->sinkPool.get(),
+          ioStats,
           fileSystemStats_.get()),
       options);
-  return maybeCreateBucketSortWriter(writerIndex, std::move(writer));
+  return maybeCreateBucketSortWriter(writerInfo, std::move(writer));
 }
 
 std::string HiveDataSink::getPartitionName(uint32_t partitionId) const {
@@ -1093,22 +1011,22 @@ std::string HiveDataSink::getPartitionName(uint32_t partitionId) const {
 
 std::unique_ptr<facebook::velox::dwio::common::Writer>
 HiveDataSink::maybeCreateBucketSortWriter(
-    size_t writerIndex,
+    HiveWriterInfo* writerInfo,
     std::unique_ptr<facebook::velox::dwio::common::Writer> writer) {
   if (!sortWrite()) {
     return writer;
   }
-  auto* sortPool = writerInfo_[writerIndex]->sortPool.get();
+  auto* sortPool = writerInfo->sortPool.get();
   VELOX_CHECK_NOT_NULL(sortPool);
   auto sortBuffer = std::make_unique<exec::SortBuffer>(
       getNonPartitionTypes(dataChannels_, inputType_),
       sortColumnIndices_,
       sortCompareFlags_,
       sortPool,
-      writerInfo_[writerIndex]->nonReclaimableSectionHolder.get(),
+      writerInfo->nonReclaimableSectionHolder.get(),
       connectorQueryCtx_->prefixSortConfig(),
       spillConfig_,
-      writerInfo_[writerIndex]->spillStats.get());
+      writerInfo->spillStats.get());
 
   return std::make_unique<dwio::common::SortingWriter>(
       std::move(writer),
