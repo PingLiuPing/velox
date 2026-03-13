@@ -521,6 +521,7 @@ struct HiveWriterIdEq {
   }
 };
 
+class BucketSortingWriter;
 class PartitionWriter;
 
 class HiveDataSink : public DataSink {
@@ -661,10 +662,6 @@ class HiveDataSink : public DataSink {
     io::IoStatistics* const ioStats_;
   };
 
-  FOLLY_ALWAYS_INLINE bool sortWrite() const {
-    return !sortColumnIndices_.empty();
-  }
-
   // Returns true if the table is partitioned.
   FOLLY_ALWAYS_INLINE bool isPartitioned() const {
     return partitionIdGenerator_ != nullptr;
@@ -712,11 +709,6 @@ class HiveDataSink : public DataSink {
   // unpartitioned. Should be called only when writing to a partitioned table.
   virtual std::string getPartitionName(uint32_t partitionId) const;
 
-  std::unique_ptr<facebook::velox::dwio::common::Writer>
-  maybeCreateBucketSortWriter(
-      HiveWriterInfo* writerInfo,
-      std::unique_ptr<facebook::velox::dwio::common::Writer> writer);
-
   HiveWriterParameters getWriterParameters(
       const std::optional<std::string>& partition,
       std::optional<uint32_t> bucketId) const;
@@ -757,16 +749,15 @@ class HiveDataSink : public DataSink {
   const std::unique_ptr<core::PartitionFunction> bucketFunction_;
   const std::shared_ptr<dwio::common::WriterFactory> writerFactory_;
   const common::SpillConfig* const spillConfig_;
-  const uint64_t sortWriterFinishTimeSliceLimitMs_{0};
   const uint64_t maxTargetFileBytes_{0};
   const bool partitionKeyAsLowerCase_;
-
-  std::vector<column_index_t> sortColumnIndices_;
-  std::vector<CompareFlags> sortCompareFlags_;
 
   State state_{State::kRunning};
 
   tsan_atomic<bool> nonReclaimableSection_{false};
+
+  // Wraps format writers with SortingWriter when bucket sorting is enabled.
+  std::unique_ptr<BucketSortingWriter> bucketSortingWriter_;
 
   // Routes rows to writers by partition/bucket and owns the RotationWriters.
   std::unique_ptr<PartitionWriter> partitionWriter_;

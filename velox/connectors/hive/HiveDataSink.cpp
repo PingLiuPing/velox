@@ -16,6 +16,7 @@
 
 #include "velox/connectors/hive/HiveDataSink.h"
 
+#include "velox/connectors/hive/BucketSortingWriter.h"
 #include "velox/connectors/hive/PartitionWriter.h"
 
 #include "velox/common/base/Counters.h"
@@ -497,9 +498,6 @@ HiveDataSink::HiveDataSink(
       writerFactory_(
           dwio::common::getWriterFactory(insertTableHandle_->storageFormat())),
       spillConfig_(connectorQueryCtx->spillConfig()),
-      sortWriterFinishTimeSliceLimitMs_(getFinishTimeSliceLimitMsFromHiveConfig(
-          hiveConfig_,
-          connectorQueryCtx->sessionProperties())),
       maxTargetFileBytes_(hiveConfig_->maxTargetFileSizeBytes(
           connectorQueryCtx->sessionProperties())),
       partitionKeyAsLowerCase_(hiveConfig_->isPartitionPathAsLowerCase(
@@ -519,6 +517,43 @@ HiveDataSink::HiveDataSink(
       "Unsupported commit strategy: {}",
       CommitStrategyName::toName(commitStrategy_));
 
+  // Build bucket sort configuration.
+  std::vector<column_index_t> sortColumnIndices;
+  std::vector<CompareFlags> sortCompareFlags;
+  if (isBucketed()) {
+    const auto& sortedProperty =
+        insertTableHandle_->bucketProperty()->sortedBy();
+    if (!sortedProperty.empty()) {
+      sortColumnIndices.reserve(sortedProperty.size());
+      sortCompareFlags.reserve(sortedProperty.size());
+      for (int i = 0; i < sortedProperty.size(); ++i) {
+        auto columnIndex =
+            getNonPartitionTypes(dataChannels_, inputType_)
+                ->getChildIdxIfExists(sortedProperty.at(i)->sortColumn());
+        if (columnIndex.has_value()) {
+          sortColumnIndices.push_back(columnIndex.value());
+          sortCompareFlags.push_back(
+              {sortedProperty.at(i)->sortOrder().isNullsFirst(),
+               sortedProperty.at(i)->sortOrder().isAscending(),
+               false,
+               CompareFlags::NullHandlingMode::kNullAsValue});
+        }
+      }
+    }
+  }
+  bucketSortingWriter_ = std::make_unique<BucketSortingWriter>(
+      getNonPartitionTypes(dataChannels_, inputType_),
+      std::move(sortColumnIndices),
+      std::move(sortCompareFlags),
+      getFinishTimeSliceLimitMsFromHiveConfig(
+          hiveConfig_, connectorQueryCtx->sessionProperties()),
+      hiveConfig_->sortWriterMaxOutputRows(
+          connectorQueryCtx->sessionProperties()),
+      hiveConfig_->sortWriterMaxOutputBytes(
+          connectorQueryCtx->sessionProperties()),
+      connectorQueryCtx_->prefixSortConfig(),
+      spillConfig_);
+
   partitionWriter_ = std::make_unique<PartitionWriter>(
       maxOpenWriters_,
       dataChannels_,
@@ -530,28 +565,6 @@ HiveDataSink::HiveDataSink(
         !isPartitioned() && !isBucketed(),
         "ensureFiles is not supported with bucketing or partition keys in the data");
     partitionWriter_->ensureWriter(HiveWriterId::unpartitionedId());
-  }
-
-  if (!isBucketed()) {
-    return;
-  }
-  const auto& sortedProperty = insertTableHandle_->bucketProperty()->sortedBy();
-  if (!sortedProperty.empty()) {
-    sortColumnIndices_.reserve(sortedProperty.size());
-    sortCompareFlags_.reserve(sortedProperty.size());
-    for (int i = 0; i < sortedProperty.size(); ++i) {
-      auto columnIndex =
-          getNonPartitionTypes(dataChannels_, inputType_)
-              ->getChildIdxIfExists(sortedProperty.at(i)->sortColumn());
-      if (columnIndex.has_value()) {
-        sortColumnIndices_.push_back(columnIndex.value());
-        sortCompareFlags_.push_back(
-            {sortedProperty.at(i)->sortOrder().isNullsFirst(),
-             sortedProperty.at(i)->sortOrder().isAscending(),
-             false,
-             CompareFlags::NullHandlingMode::kNullAsValue});
-      }
-    }
   }
 }
 
@@ -729,11 +742,12 @@ bool HiveDataSink::finish() {
 
   // As for now, only sorted writer needs flush buffered data. For non-sorted
   // writer, data is directly written to the underlying file writer.
-  if (!sortWrite()) {
+  if (!bucketSortingWriter_->enabled()) {
     return true;
   }
 
-  return partitionWriter_->finish(sortWriterFinishTimeSliceLimitMs_);
+  return partitionWriter_->finish(
+      bucketSortingWriter_->finishTimeSliceLimitMs());
 }
 
 std::vector<std::string> HiveDataSink::close() {
@@ -868,7 +882,7 @@ std::unique_ptr<RotationWriter> HiveDataSink::createRotationWriter(
   auto writerPool = createWriterPool(id);
   auto sinkPool = createSinkPool(writerPool);
   std::shared_ptr<memory::MemoryPool> sortPool{nullptr};
-  if (sortWrite()) {
+  if (bucketSortingWriter_->enabled()) {
     sortPool = createSortPool(writerPool);
   }
   auto writerInfo = std::make_shared<HiveWriterInfo>(
@@ -882,7 +896,7 @@ std::unique_ptr<RotationWriter> HiveDataSink::createRotationWriter(
 
   auto formatWriter = createFormatWriter(writerInfo.get(), ioStats.get());
 
-  const bool canRotate = !isBucketed() && !sortWrite();
+  const bool canRotate = !isBucketed() && !bucketSortingWriter_->enabled();
   const auto writerIndex = partitionWriter_->writers().size();
   auto rotationWriter = std::make_unique<RotationWriter>(
       std::move(formatWriter),
@@ -936,7 +950,7 @@ std::unique_ptr<dwio::common::Writer> HiveDataSink::createFormatWriter(
           ioStats,
           fileSystemStats_.get()),
       options);
-  return maybeCreateBucketSortWriter(writerInfo, std::move(writer));
+  return bucketSortingWriter_->wrap(writerInfo, std::move(writer));
 }
 
 std::string HiveDataSink::getPartitionName(uint32_t partitionId) const {
@@ -946,35 +960,6 @@ std::string HiveDataSink::getPartitionName(uint32_t partitionId) const {
       partitionId,
       partitionIdGenerator_->partitionValues(),
       partitionKeyAsLowerCase_);
-}
-
-std::unique_ptr<facebook::velox::dwio::common::Writer>
-HiveDataSink::maybeCreateBucketSortWriter(
-    HiveWriterInfo* writerInfo,
-    std::unique_ptr<facebook::velox::dwio::common::Writer> writer) {
-  if (!sortWrite()) {
-    return writer;
-  }
-  auto* sortPool = writerInfo->sortPool.get();
-  VELOX_CHECK_NOT_NULL(sortPool);
-  auto sortBuffer = std::make_unique<exec::SortBuffer>(
-      getNonPartitionTypes(dataChannels_, inputType_),
-      sortColumnIndices_,
-      sortCompareFlags_,
-      sortPool,
-      writerInfo->nonReclaimableSectionHolder.get(),
-      connectorQueryCtx_->prefixSortConfig(),
-      spillConfig_,
-      writerInfo->spillStats.get());
-
-  return std::make_unique<dwio::common::SortingWriter>(
-      std::move(writer),
-      std::move(sortBuffer),
-      hiveConfig_->sortWriterMaxOutputRows(
-          connectorQueryCtx_->sessionProperties()),
-      hiveConfig_->sortWriterMaxOutputBytes(
-          connectorQueryCtx_->sessionProperties()),
-      sortWriterFinishTimeSliceLimitMs_);
 }
 
 HiveWriterParameters HiveDataSink::getWriterParameters(

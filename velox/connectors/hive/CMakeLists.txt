@@ -21,6 +21,7 @@ add_subdirectory(paimon)
 velox_add_library(
   velox_hive_connector
   OBJECT
+  BucketSortingWriter.cpp
   BufferedInputBuilder.cpp
   FileHandle.cpp
   HiveConfig.cpp
