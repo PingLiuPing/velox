@@ -517,6 +517,10 @@ HiveDataSink::HiveDataSink(
       "Unsupported commit strategy: {}",
       CommitStrategyName::toName(commitStrategy_));
 
+  // Compute the data column type once, used by BucketSortingWriter and
+  // PartitionWriter.
+  auto dataType = getNonPartitionTypes(dataChannels_, inputType_);
+
   // Build bucket sort configuration.
   std::vector<column_index_t> sortColumnIndices;
   std::vector<CompareFlags> sortCompareFlags;
@@ -528,8 +532,7 @@ HiveDataSink::HiveDataSink(
       sortCompareFlags.reserve(sortedProperty.size());
       for (int i = 0; i < sortedProperty.size(); ++i) {
         auto columnIndex =
-            getNonPartitionTypes(dataChannels_, inputType_)
-                ->getChildIdxIfExists(sortedProperty.at(i)->sortColumn());
+            dataType->getChildIdxIfExists(sortedProperty.at(i)->sortColumn());
         if (columnIndex.has_value()) {
           sortColumnIndices.push_back(columnIndex.value());
           sortCompareFlags.push_back(
@@ -542,7 +545,7 @@ HiveDataSink::HiveDataSink(
     }
   }
   bucketSortingWriter_ = std::make_unique<BucketSortingWriter>(
-      getNonPartitionTypes(dataChannels_, inputType_),
+      dataType,
       std::move(sortColumnIndices),
       std::move(sortCompareFlags),
       getFinishTimeSliceLimitMsFromHiveConfig(
@@ -557,7 +560,10 @@ HiveDataSink::HiveDataSink(
   partitionWriter_ = std::make_unique<PartitionWriter>(
       maxOpenWriters_,
       dataChannels_,
-      [this](const HiveWriterId& id) { return createRotationWriter(id); },
+      std::move(dataType),
+      [this](const HiveWriterId& id, uint32_t writerIndex) {
+        return createRotationWriter(id, writerIndex);
+      },
       connectorQueryCtx_->memoryPool());
 
   if (insertTableHandle_->ensureFiles()) {
@@ -870,7 +876,8 @@ std::shared_ptr<dwio::common::WriterOptions> HiveDataSink::createWriterOptions(
 }
 
 std::unique_ptr<RotationWriter> HiveDataSink::createRotationWriter(
-    const HiveWriterId& id) {
+    const HiveWriterId& id,
+    uint32_t writerIndex) {
   std::optional<std::string> partitionName;
   if (isPartitioned()) {
     partitionName = getPartitionName(id.partitionId.value());
@@ -897,7 +904,6 @@ std::unique_ptr<RotationWriter> HiveDataSink::createRotationWriter(
   auto formatWriter = createFormatWriter(writerInfo.get(), ioStats.get());
 
   const bool canRotate = !isBucketed() && !bucketSortingWriter_->enabled();
-  const auto writerIndex = partitionWriter_->writers().size();
   auto rotationWriter = std::make_unique<RotationWriter>(
       std::move(formatWriter),
       writerInfo,

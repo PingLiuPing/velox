@@ -22,23 +22,11 @@
 namespace facebook::velox::connector::hive {
 namespace {
 
-RowTypePtr getNonPartitionTypes(
-    const std::vector<column_index_t>& dataCols,
-    const RowTypePtr& inputType) {
-  std::vector<std::string> childNames;
-  std::vector<TypePtr> childTypes;
-  const auto& dataSize = dataCols.size();
-  childNames.reserve(dataSize);
-  childTypes.reserve(dataSize);
-  for (int dataCol : dataCols) {
-    childNames.push_back(inputType->nameOf(dataCol));
-    childTypes.push_back(inputType->childAt(dataCol));
-  }
-  return ROW(std::move(childNames), std::move(childTypes));
-}
-
+/// Extract data columns from input, producing a RowVector with only the
+/// non-partition columns.
 RowVectorPtr makeDataInput(
     const std::vector<column_index_t>& dataCols,
+    const RowTypePtr& dataType,
     const RowVectorPtr& input) {
   std::vector<VectorPtr> childVectors;
   childVectors.reserve(dataCols.size());
@@ -47,7 +35,7 @@ RowVectorPtr makeDataInput(
   }
   return std::make_shared<RowVector>(
       input->pool(),
-      getNonPartitionTypes(dataCols, asRowType(input->type())),
+      dataType,
       input->nulls(),
       input->size(),
       std::move(childVectors),
@@ -59,10 +47,12 @@ RowVectorPtr makeDataInput(
 PartitionWriter::PartitionWriter(
     uint32_t maxOpenWriters,
     const std::vector<column_index_t>& dataChannels,
+    RowTypePtr dataType,
     WriterFactory writerFactory,
     memory::MemoryPool* pool)
     : maxOpenWriters_(maxOpenWriters),
       dataChannels_(dataChannels),
+      dataType_(std::move(dataType)),
       writerFactory_(std::move(writerFactory)),
       pool_(pool) {}
 
@@ -129,7 +119,7 @@ uint32_t PartitionWriter::ensureWriter(const HiveWriterId& id) {
   VELOX_CHECK_EQ(writerIndexMap_.size(), writers_.size());
 
   const auto writerIndex = writers_.size();
-  writers_.emplace_back(writerFactory_(id));
+  writers_.emplace_back(writerFactory_(id, writerIndex));
 
   partitionSizes_.emplace_back(0);
   partitionRows_.emplace_back(nullptr);
@@ -145,10 +135,8 @@ uint32_t PartitionWriter::ensureWriter(const HiveWriterId& id) {
 }
 
 void PartitionWriter::writeToWriter(size_t index, RowVectorPtr input) {
-  auto dataInput = makeDataInput(dataChannels_, input);
+  auto dataInput = makeDataInput(dataChannels_, dataType_, input);
   writers_[index]->write(dataInput);
-  writers_[index]->writerInfo()->inputSizeInBytes +=
-      dataInput->estimateFlatSize();
 }
 
 HiveWriterId PartitionWriter::getWriterId(

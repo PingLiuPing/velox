@@ -48,6 +48,7 @@ void RotationWriter::write(const VectorPtr& data) {
   const auto numRows = data->size();
   writerInfo_->numWrittenRows += numRows;
   writerInfo_->currentFileWrittenRows += numRows;
+  writerInfo_->inputSizeInBytes += data->estimateFlatSize();
 
   if (!canRotate_ || maxTargetFileBytes_ == 0) {
     return;

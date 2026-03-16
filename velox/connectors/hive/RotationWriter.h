@@ -19,13 +19,8 @@
 #include <memory>
 
 #include "velox/common/io/IoStatistics.h"
+#include "velox/connectors/hive/HiveWriterTypes.h"
 #include "velox/dwio/common/Writer.h"
-
-// Forward declarations to avoid heavy includes.
-namespace facebook::velox::connector::hive {
-struct HiveWriterInfo;
-struct HiveFileInfo;
-} // namespace facebook::velox::connector::hive
 
 namespace facebook::velox::connector::hive {
 

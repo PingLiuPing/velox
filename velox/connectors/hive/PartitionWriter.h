@@ -19,8 +19,10 @@
 #include <memory>
 #include <vector>
 
-#include "velox/connectors/hive/HiveDataSink.h"
+#include "velox/common/memory/RawVector.h"
+#include "velox/connectors/hive/HiveWriterTypes.h"
 #include "velox/connectors/hive/RotationWriter.h"
+#include "velox/vector/ComplexVector.h"
 
 namespace facebook::velox::connector::hive {
 
@@ -29,9 +31,10 @@ namespace facebook::velox::connector::hive {
 /// input rows to writers by partition/bucket assignment.
 class PartitionWriter {
  public:
-  /// Factory to create a RotationWriter for a given writer ID.
-  using WriterFactory =
-      std::function<std::unique_ptr<RotationWriter>(const HiveWriterId& id)>;
+  /// Factory to create a RotationWriter for a given writer ID and index.
+  using WriterFactory = std::function<std::unique_ptr<RotationWriter>(
+      const HiveWriterId& id,
+      uint32_t writerIndex)>;
 
   /// Callback invoked after a new writer is created.
   using OnWriterCreated =
@@ -39,11 +42,13 @@ class PartitionWriter {
 
   /// @param maxOpenWriters Maximum number of open writers allowed.
   /// @param dataChannels Column indices for data columns to write.
+  /// @param dataType Schema of the data columns (non-partition columns).
   /// @param writerFactory Factory to create new RotationWriters.
   /// @param pool Memory pool for partition row index buffers.
   PartitionWriter(
       uint32_t maxOpenWriters,
       const std::vector<column_index_t>& dataChannels,
+      RowTypePtr dataType,
       WriterFactory writerFactory,
       memory::MemoryPool* pool);
 
@@ -105,6 +110,7 @@ class PartitionWriter {
 
   const uint32_t maxOpenWriters_;
   const std::vector<column_index_t> dataChannels_;
+  const RowTypePtr dataType_;
   WriterFactory writerFactory_;
   memory::MemoryPool* pool_;
 
