@@ -78,8 +78,12 @@ class IcebergInsertTableHandle final : public HiveInsertTableHandle {
 using IcebergInsertTableHandlePtr =
     std::shared_ptr<const IcebergInsertTableHandle>;
 
+/// Specializes HiveDataSink for Iceberg writes by computing transformed
+/// partition ids and collecting file-level statistics required by the Iceberg
+/// commit protocol.
 class IcebergDataSink : public HiveDataSink {
  public:
+  /// Creates an Iceberg-aware data sink for the provided table handle.
   IcebergDataSink(
       RowTypePtr inputType,
       IcebergInsertTableHandlePtr insertTableHandle,
@@ -149,19 +153,22 @@ class IcebergDataSink : public HiveDataSink {
   // (e.g., "date_year=2023/id_bucket=5").
   std::string getPartitionName(uint32_t partitionId) const override;
 
-  // Ensures a writer exists for the given writer ID and returns its index.
-  // If the writer doesn't exist, creates it by calling appendWriter().
-  // Additionally, extracts and stores the transformed partition values for
-  // the writer in commitPartitionValue_ if not already set, which will be
-  // included in the commit message as "partitionDataJson".
-  uint32_t ensureWriter(const HiveWriterId& id) override;
+  // Applies Iceberg-specific parquet writer settings on top of the common
+  // per-writer options prepared by LogicalWriterFactory.
+  void customizeWriterOptions(
+      const WriterInfo& writerInfo,
+      const std::shared_ptr<dwio::common::WriterOptions>& options)
+      const override;
 
-  // Creates writer options configured for Iceberg table writes. Extends the
-  // base HiveDataSink writer options with Iceberg-specific settings:
-  // - Sets timestamp timezone to nullopt (UTC) for Iceberg compliance.
-  // - Sets timestamp precision to microseconds.
-  std::shared_ptr<dwio::common::WriterOptions> createWriterOptions(
-      size_t writerIndex) const override;
+  // Captures transformed partition values when a new partition writer is
+  // created so commitMessage() can serialize them later.
+  void onWriterCreated(const WriterId& id, uint32_t writerIndex) override;
+
+  // Aggregates per-file statistics after each rotated or final file is closed.
+  void onFileClosed(
+      uint32_t writerIndex,
+      std::optional<FileInfo> fileInfo,
+      std::unique_ptr<dwio::common::FileMetadata> metadata) override;
 
   // Extracts partition values for a specific writer to be included in the
   // commit message. Converts the transformed partition values from columnar
@@ -170,10 +177,6 @@ class IcebergDataSink : public HiveDataSink {
   // values for the given writer index) for JSON serialization.
   // Returns nullptr for null partition values.
   folly::dynamic makeCommitPartitionValue(uint32_t writerIndex) const;
-
-  void rotateWriter(size_t index) override;
-
-  void closeInternal() override;
 
   // Iceberg partition specification defining how the table is partitioned.
   // Contains partition fields with source column names, transform types
@@ -223,11 +226,10 @@ class IcebergDataSink : public HiveDataSink {
   std::vector<folly::dynamic> commitPartitionValue_;
 
   // Statistics for all data files written by this sink, organized by writer
-  // index and file index within each writer. These statistics are populated
-  // during rotateWriter() (for rotated files) and during closeInternal()
-  // (for the final file of each writer). These metrics are subsequently used
-  // to construct Iceberg commit messages.
-  // Outer vector: indexed by writer index (same as writerInfo_).
+  // index and file index within each writer. These metrics are collected in
+  // onFileClosed() and are subsequently used to construct Iceberg commit
+  // messages.
+  // Outer vector: indexed by writer index.
   // Inner vector: one entry per file written by that writer (including
   // rotated files and the final file). Each entry corresponds to one
   // individual data file.

@@ -21,10 +21,12 @@
 #include "velox/connectors/hive/HivePartitionName.h"
 #include "velox/connectors/hive/PartitionIdGenerator.h"
 #include "velox/connectors/hive/TableHandle.h"
+#include "velox/connectors/hive/WriterInfo.h"
 #include "velox/dwio/common/Options.h"
-#include "velox/dwio/common/Writer.h"
-#include "velox/dwio/common/WriterFactory.h"
-#include "velox/exec/MemoryReclaimer.h"
+
+namespace facebook::velox::dwio::common {
+class FileMetadata;
+} // namespace facebook::velox::dwio::common
 
 namespace facebook::velox::connector::hive {
 
@@ -337,248 +339,20 @@ class HiveInsertTableHandle : public ConnectorInsertTableHandle {
   const std::vector<column_index_t> nonPartitionChannels_;
 };
 
-/// Parameters for Hive writers.
-class HiveWriterParameters {
- public:
-  enum class UpdateMode {
-    kNew, // Write files to a new directory.
-    kOverwrite, // Overwrite an existing directory.
-    // Append mode is currently only supported for unpartitioned tables.
-    kAppend, // Append to an unpartitioned table.
-  };
+class PartitionWriter;
+class LogicalWriterFactory;
 
-  /// @param updateMode Write the files to a new directory, or append to an
-  /// existing directory or overwrite an existing directory.
-  /// @param partitionName Partition name in the typical Hive style, which is
-  /// also the partition subdirectory part of the partition path.
-  /// @param targetFileName The final name of a file after committing.
-  /// @param targetDirectory The final directory that a file should be in after
-  /// committing.
-  /// @param writeFileName The temporary name of the file that a running writer
-  /// writes to. If a running writer writes directory to the target file, set
-  /// writeFileName to targetFileName by default.
-  /// @param writeDirectory The temporary directory that a running writer writes
-  /// to. If a running writer writes directory to the target directory, set
-  /// writeDirectory to targetDirectory by default.
-  HiveWriterParameters(
-      UpdateMode updateMode,
-      std::optional<std::string> partitionName,
-      std::string targetFileName,
-      std::string targetDirectory,
-      std::optional<std::string> writeFileName = std::nullopt,
-      std::optional<std::string> writeDirectory = std::nullopt)
-      : updateMode_(updateMode),
-        partitionName_(std::move(partitionName)),
-        targetFileName_(std::move(targetFileName)),
-        targetDirectory_(std::move(targetDirectory)),
-        writeFileName_(writeFileName.value_or(targetFileName_)),
-        writeDirectory_(writeDirectory.value_or(targetDirectory_)) {}
-
-  UpdateMode updateMode() const {
-    return updateMode_;
-  }
-
-  static std::string updateModeToString(UpdateMode updateMode) {
-    switch (updateMode) {
-      case UpdateMode::kNew:
-        return "NEW";
-      case UpdateMode::kOverwrite:
-        return "OVERWRITE";
-      case UpdateMode::kAppend:
-        return "APPEND";
-      default:
-        VELOX_UNSUPPORTED("Unsupported update mode.");
-    }
-  }
-
-  const std::optional<std::string>& partitionName() const {
-    return partitionName_;
-  }
-
-  const std::string& targetFileName() const {
-    return targetFileName_;
-  }
-
-  const std::string& writeFileName() const {
-    return writeFileName_;
-  }
-
-  const std::string& targetDirectory() const {
-    return targetDirectory_;
-  }
-
-  const std::string& writeDirectory() const {
-    return writeDirectory_;
-  }
-
- private:
-  const UpdateMode updateMode_;
-  const std::optional<std::string> partitionName_;
-  const std::string targetFileName_;
-  const std::string targetDirectory_;
-  const std::string writeFileName_;
-  const std::string writeDirectory_;
-};
-
-/// Information about a single file written as part of a writer's output.
-/// When file rotation occurs, multiple HiveFileInfo entries are created.
-struct HiveFileInfo {
-  /// The temporary file name used during writing (in the staging directory).
-  std::string writeFileName;
-  /// The final file name after commit (in the target directory).
-  std::string targetFileName;
-  /// Size of the file in bytes.
-  uint64_t fileSize{0};
-  /// Number of rows in the file.
-  uint64_t numRows{0};
-};
-
-struct HiveWriterInfo {
-  HiveWriterInfo(
-      HiveWriterParameters parameters,
-      std::shared_ptr<memory::MemoryPool> _writerPool,
-      std::shared_ptr<memory::MemoryPool> _sinkPool,
-      std::shared_ptr<memory::MemoryPool> _sortPool)
-      : writerParameters(std::move(parameters)),
-        nonReclaimableSectionHolder(new tsan_atomic<bool>(false)),
-        spillStats(std::make_unique<exec::SpillStats>()),
-        writerPool(std::move(_writerPool)),
-        sinkPool(std::move(_sinkPool)),
-        sortPool(std::move(_sortPool)) {}
-
-  const HiveWriterParameters writerParameters;
-  const std::unique_ptr<tsan_atomic<bool>> nonReclaimableSectionHolder;
-  /// Collects the spill stats from sort writer if the spilling has been
-  /// triggered.
-  const std::unique_ptr<exec::SpillStats> spillStats;
-  const std::shared_ptr<memory::MemoryPool> writerPool;
-  const std::shared_ptr<memory::MemoryPool> sinkPool;
-  const std::shared_ptr<memory::MemoryPool> sortPool;
-  /// Total rows written by this writer across all files.
-  uint64_t numWrittenRows = 0;
-  /// Rows written to the current file; reset to 0 when the file is finalized.
-  uint64_t currentFileWrittenRows{0};
-  uint64_t inputSizeInBytes = 0;
-  /// File sequence number for tracking multiple files written due to size-based
-  /// splitting. Incremented each time the writer rotates to a new file.
-  /// Used to generate sequenced file names (e.g., file_1.orc, file_2.orc).
-  /// Invariant during write: fileSequenceNumber == writtenFiles.size()
-  /// After close: fileSequenceNumber + 1 == writtenFiles.size() (final file
-  /// added)
-  uint32_t fileSequenceNumber{0};
-  /// Tracks all files written by this writer.
-  /// During write: contains only rotated (completed) files.
-  /// After close: contains all files including the final one (via
-  /// finalizeWriterFile).
-  std::vector<HiveFileInfo> writtenFiles;
-  /// Snapshot of total bytes written at the start of the current file.
-  /// Used as baseline to calculate current file size: rawBytesWritten() - this.
-  /// Updated to ioStats->rawBytesWritten() after each rotation.
-  uint64_t cumulativeWrittenBytes{0};
-  /// Current file's write filename (set when file is created/rotated).
-  /// This avoids recomputing makeSequencedFileName() in commitMessage().
-  std::string currentWriteFileName;
-  /// Current file's target filename (set when file is created/rotated).
-  std::string currentTargetFileName;
-};
-
-/// Identifies a hive writer.
-struct HiveWriterId {
-  std::optional<uint32_t> partitionId{std::nullopt};
-  std::optional<uint32_t> bucketId{std::nullopt};
-
-  HiveWriterId() = default;
-
-  HiveWriterId(
-      std::optional<uint32_t> _partitionId,
-      std::optional<uint32_t> _bucketId = std::nullopt)
-      : partitionId(_partitionId), bucketId(_bucketId) {}
-
-  /// Returns the special writer id for the un-partitioned (and non-bucketed)
-  /// table.
-  static const HiveWriterId& unpartitionedId();
-
-  std::string toString() const;
-
-  bool operator==(const HiveWriterId& other) const {
-    return std::tie(partitionId, bucketId) ==
-        std::tie(other.partitionId, other.bucketId);
-  }
-};
-
-struct HiveWriterIdHasher {
-  std::size_t operator()(const HiveWriterId& id) const {
-    return bits::hashMix(
-        id.partitionId.value_or(std::numeric_limits<uint32_t>::max()),
-        id.bucketId.value_or(std::numeric_limits<uint32_t>::max()));
-  }
-};
-
-struct HiveWriterIdEq {
-  bool operator()(const HiveWriterId& lhs, const HiveWriterId& rhs) const {
-    return lhs == rhs;
-  }
-};
-
-/// JSON field names for the partition update object produced by each writer
-/// and consumed by the Presto coordinator to finalize files and update the
-/// metastore.
-///
-/// JSON structure:
-/// {
-///   "name":                        "<partition key, e.g. ds=2024-01-01>",
-///   "updateMode":                  "NEW" | "APPEND" | "OVERWRITE",
-///   "writePath":                   "<staging directory>",
-///   "targetPath":                  "<final directory>",
-///   "fileWriteInfos": [
-///     {
-///       "writeFileName":           "<temp filename in writePath>",
-///       "targetFileName":          "<final filename in targetPath>",
-///       "fileSize":                <bytes>
-///     }
-///   ],
-///   "rowCount":                    <total rows>,
-///   "inMemoryDataSizeInBytes":     <uncompressed bytes>,
-///   "onDiskDataSizeInBytes":       <compressed bytes on disk>,
-///   "containsNumberedFileNames":   true | false
-/// }
-struct HiveCommitMessage {
-  /// Partition directory name in Hive format (e.g., "ds=2024-01-01/region=us").
-  /// Empty string for unpartitioned tables.
-  static constexpr const char* kName = "name";
-  /// Write mode: "NEW", "APPEND", or "OVERWRITE". Controls how the committer
-  /// handles metastore updates and existing file conflicts.
-  static constexpr const char* kUpdateMode = "updateMode";
-  /// Staging directory where files were written during execution.
-  static constexpr const char* kWritePath = "writePath";
-  /// Final destination directory. Files are renamed from writePath to
-  /// targetPath during commit.
-  static constexpr const char* kTargetPath = "targetPath";
-  /// Array of per-file metadata objects. One entry per file written, including
-  /// rotated files.
-  static constexpr const char* kFileWriteInfos = "fileWriteInfos";
-  /// Temporary filename used during writing (in the staging directory).
-  static constexpr const char* kWriteFileName = "writeFileName";
-  /// Final filename after commit (in the target directory).
-  static constexpr const char* kTargetFileName = "targetFileName";
-  /// Size of individual file in bytes.
-  static constexpr const char* kFileSize = "fileSize";
-  /// Total rows written to this partition across all files.
-  static constexpr const char* kRowCount = "rowCount";
-  /// Uncompressed input data size in bytes.
-  static constexpr const char* kInMemoryDataSizeInBytes =
-      "inMemoryDataSizeInBytes";
-  /// Compressed bytes written to disk.
-  static constexpr const char* kOnDiskDataSizeInBytes = "onDiskDataSizeInBytes";
-  /// Whether filenames follow a numbered sequence from file rotation.
-  static constexpr const char* kContainsNumberedFileNames =
-      "containsNumberedFileNames";
-};
-
+/// Orchestrates a table write by computing partition and bucket ids, creating
+/// logical writers through a routing strategy, and producing the final commit
+/// protocol payload consumed by the coordinator.
 class HiveDataSink : public DataSink {
  public:
   /// The list of runtime stats reported by hive data sink
   static constexpr const char* kEarlyFlushedRawBytes = "earlyFlushedRawBytes";
+
+  /// Releases the sink after all owned writers and routing state have been
+  /// destroyed.
+  ~HiveDataSink() override;
 
   /// Defines the execution states of a hive data sink running internally.
   enum class State {
@@ -649,18 +423,28 @@ class HiveDataSink : public DataSink {
       const std::vector<column_index_t>& dataChannels,
       std::unique_ptr<PartitionIdGenerator> partitionIdGenerator);
 
+  /// Appends a batch of input rows to the sink, routing each row to the
+  /// correct logical writer.
   void appendData(RowVectorPtr input) override;
 
+  /// Finishes any buffered writer state and returns false when a writer yields
+  /// and requires another finish() call.
   bool finish() override;
 
+  /// Returns aggregate write statistics collected by all logical writers.
   Stats stats() const override;
 
+  /// Returns runtime statistics reported by the underlying file system layer.
   std::unordered_map<std::string, RuntimeCounter> runtimeStats() const override;
 
+  /// Closes the sink, finalizes all files, and returns the commit protocol
+  /// payload for the coordinator.
   std::vector<std::string> close() override;
 
+  /// Aborts the sink and drops any uncommitted writer state.
   void abort() override;
 
+  /// Returns true when the sink can reclaim memory from its format writers.
   bool canReclaim() const;
 
  protected:
@@ -676,46 +460,6 @@ class HiveDataSink : public DataSink {
   // @return Vector of JSON strings, one per writer.
   virtual std::vector<std::string> commitMessage() const;
 
-  class WriterReclaimer : public exec::MemoryReclaimer {
-   public:
-    static std::unique_ptr<memory::MemoryReclaimer> create(
-        HiveDataSink* dataSink,
-        HiveWriterInfo* writerInfo,
-        io::IoStatistics* ioStats);
-
-    bool reclaimableBytes(
-        const memory::MemoryPool& pool,
-        uint64_t& reclaimableBytes) const override;
-
-    uint64_t reclaim(
-        memory::MemoryPool* pool,
-        uint64_t targetBytes,
-        uint64_t maxWaitMs,
-        memory::MemoryReclaimer::Stats& stats) override;
-
-   private:
-    WriterReclaimer(
-        HiveDataSink* dataSink,
-        HiveWriterInfo* writerInfo,
-        io::IoStatistics* ioStats)
-        : exec::MemoryReclaimer(0),
-          dataSink_(dataSink),
-          writerInfo_(writerInfo),
-          ioStats_(ioStats) {
-      VELOX_CHECK_NOT_NULL(dataSink_);
-      VELOX_CHECK_NOT_NULL(writerInfo_);
-      VELOX_CHECK_NOT_NULL(ioStats_);
-    }
-
-    HiveDataSink* const dataSink_;
-    HiveWriterInfo* const writerInfo_;
-    io::IoStatistics* const ioStats_;
-  };
-
-  FOLLY_ALWAYS_INLINE bool sortWrite() const {
-    return !sortColumnIndices_.empty();
-  }
-
   // Returns true if the table is partitioned.
   FOLLY_ALWAYS_INLINE bool isPartitioned() const {
     return partitionIdGenerator_ != nullptr;
@@ -730,55 +474,14 @@ class HiveDataSink : public DataSink {
     return commitStrategy_ != CommitStrategy::kNoCommit;
   }
 
-  std::shared_ptr<memory::MemoryPool> createWriterPool(
-      const HiveWriterId& writerId);
-
-  void setMemoryReclaimers(
-      HiveWriterInfo* writerInfo,
-      io::IoStatistics* ioStats);
-
-  // Returns the bytes written to the current file for the specified writer.
-  // This is calculated as total bytes minus cumulative bytes from rotated
-  // files. Use this instead of rawBytesWritten() when you need current file
-  // size.
-  uint64_t getCurrentFileBytes(size_t writerIndex) const;
-
   // Compute the partition id and bucket id for each row in 'input'.
   virtual void computePartitionAndBucketIds(const RowVectorPtr& input);
 
-  // Get the HiveWriter corresponding to the row
-  // from partitionIds and bucketIds.
-  HiveWriterId getWriterId(size_t row) const;
-
-  // Computes the number of input rows as well as the actual input row indices
-  // to each corresponding (bucketed) partition based on the partition and
-  // bucket ids calculated by 'computePartitionAndBucketIds'. The function also
-  // ensures that there is a writer created for each (bucketed) partition.
-  void splitInputRowsAndEnsureWriters();
-
-  // Makes sure to create one writer for the given writer id. The function
-  // returns the corresponding index in 'writers_'.
-  virtual uint32_t ensureWriter(const HiveWriterId& id);
-
-  // Appends a new writer for the given 'id'. The function returns the index of
-  // the newly created writer in 'writers_'.
-  uint32_t appendWriter(const HiveWriterId& id);
-
-  // Creates a writer for the given index using the current file sequence.
-  std::unique_ptr<facebook::velox::dwio::common::Writer> createWriterForIndex(
-      size_t writerIndex);
-
-  // Creates and configures WriterOptions based on file format.
-  // Sets up compression, schema, and other writer configuration based on the
-  // insert table handle and connector settings.
-  // The no-argument overload uses the last writer's info (for appendWriter).
-  std::shared_ptr<dwio::common::WriterOptions> createWriterOptions() const;
-
-  // Creates WriterOptions for a specific writer index. Use this overload
-  // during writer rotation to ensure the correct writer's memory pool and
-  // nonReclaimableSection are used.
-  virtual std::shared_ptr<dwio::common::WriterOptions> createWriterOptions(
-      size_t writerIndex) const;
+  // Applies format-specific tweaks to a fully prepared per-writer options
+  // object before the leaf format writer is created.
+  virtual void customizeWriterOptions(
+      const WriterInfo& writerInfo,
+      const std::shared_ptr<dwio::common::WriterOptions>& options) const;
 
   // Returns the Hive partition directory name for the given partition ID.
   // Converts the partition values associated with the partition ID into a
@@ -786,111 +489,65 @@ class HiveDataSink : public DataSink {
   // unpartitioned. Should be called only when writing to a partitioned table.
   virtual std::string getPartitionName(uint32_t partitionId) const;
 
-  std::unique_ptr<facebook::velox::dwio::common::Writer>
-  maybeCreateBucketSortWriter(
-      size_t writerIndex,
-      std::unique_ptr<facebook::velox::dwio::common::Writer> writer);
+  // Lifecycle hooks for format-specific extensions.
+  virtual void onWriterCreated(const WriterId& id, uint32_t writerIndex);
+  virtual void onFileClosed(
+      uint32_t writerIndex,
+      std::optional<FileInfo> fileInfo,
+      std::unique_ptr<dwio::common::FileMetadata> metadata);
 
-  // Records a row index for a specific partition. This method maintains the
-  // mapping of which input rows belong to which partition by storing row
-  // indices in partition-specific buffers. If the buffer for the partition
-  // doesn't exist or is too small, it allocates/reallocates the buffer to
-  // accommodate all rows.
-  void
-  updatePartitionRows(uint32_t index, vector_size_t numRows, vector_size_t row);
-
-  HiveWriterParameters getWriterParameters(
-      const std::optional<std::string>& partition,
-      std::optional<uint32_t> bucketId) const;
-
-  // Gets write and target file names for a writer based on the table commit
-  // strategy as well as table partitioned type. If commit is not required, the
-  // write file and target file has the same name. If not, add a temp file
-  // prefix to the target file for write file name. The coordinator (or driver
-  // for Presto on spark) will rename the write file to target file to commit
-  // the table write when update the metadata store. If it is a bucketed table,
-  // the file name encodes the corresponding bucket id.
-  std::pair<std::string, std::string> getWriterFileNames(
-      std::optional<uint32_t> bucketId) const;
-
-  HiveWriterParameters::UpdateMode getUpdateMode() const;
+  WriterParameters::UpdateMode getUpdateMode() const;
 
   FOLLY_ALWAYS_INLINE void checkRunning() const {
     VELOX_CHECK_EQ(state_, State::kRunning, "Hive data sink is not running");
   }
 
-  // Invoked to write 'input' to the specified file writer.
-  void write(size_t index, RowVectorPtr input);
+  void closeInternal();
 
-  /// Rotates the writer at the given index to a new file. This is called when
-  /// the current file exceeds maxTargetFileBytes_. The old writer is closed
-  /// and a new writer is created for the same partition/bucket.
-  virtual void rotateWriter(size_t index);
-
-  /// Finalizes the current file for the writer at the given index.
-  /// Captures file stats and adds the file info to writtenFiles.
-  /// Called by rotateWriter() and closeInternal().
-  void finalizeWriterFile(size_t index);
-
-  virtual void closeInternal();
-
-  // IMPORTANT NOTE: these are passed to writers as raw pointers. HiveDataSink
-  // owns the lifetime of these objects, and therefore must destroy them last.
-  // Additionally, we must assume that no objects which hold a reference to
-  // these stats will outlive the HiveDataSink instance. This is a reasonable
-  // assumption given the semantics of these stats objects.
-  std::vector<std::unique_ptr<io::IoStatistics>> ioStats_;
-  // Generic filesystem stats, exposed as RuntimeStats
+  // Aggregates file-system level runtime statistics across all writers.
   std::unique_ptr<IoStats> fileSystemStats_;
 
+  // Stores the full input schema received by appendData().
   const RowTypePtr inputType_;
+  // Stores immutable table write configuration supplied by the connector.
   const std::shared_ptr<const HiveInsertTableHandle> insertTableHandle_;
+  // Provides query-scoped services such as memory pools and session settings.
   const ConnectorQueryCtx* const connectorQueryCtx_;
+  // Controls whether the sink writes directly to the target path or stages
+  // files for task commit.
   const CommitStrategy commitStrategy_;
+  // Provides Hive-specific session and connector configuration.
   const std::shared_ptr<const HiveConfig> hiveConfig_;
-  const HiveWriterParameters::UpdateMode updateMode_;
+  // Stores how the coordinator should publish files for this table write.
+  const WriterParameters::UpdateMode updateMode_;
+  // Limits how many logical writers may be opened concurrently.
   const uint32_t maxOpenWriters_;
+  // Stores the input-channel indices used to compute partition ids.
   const std::vector<column_index_t> partitionChannels_;
+  // Generates stable partition ids from partition-column values.
   const std::unique_ptr<PartitionIdGenerator> partitionIdGenerator_;
-  // Indices of dataChannel are stored in ascending order
+  // Stores the input-channel indices that belong to the physical data file.
   const std::vector<column_index_t> dataChannels_;
+  // Stores the configured bucket count, or zero when bucketing is disabled.
   const int32_t bucketCount_{0};
+  // Computes bucket ids for each input row when bucketing is enabled.
   const std::unique_ptr<core::PartitionFunction> bucketFunction_;
-  const std::shared_ptr<dwio::common::WriterFactory> writerFactory_;
-  const common::SpillConfig* const spillConfig_;
-  const uint64_t sortWriterFinishTimeSliceLimitMs_{0};
-  const uint64_t maxTargetFileBytes_{0};
+  // Controls whether generated partition path keys are lower-cased.
   const bool partitionKeyAsLowerCase_;
 
-  std::vector<column_index_t> sortColumnIndices_;
-  std::vector<CompareFlags> sortCompareFlags_;
-
+  // Tracks the sink lifecycle state across append, finish, close, and abort.
   State state_{State::kRunning};
 
-  tsan_atomic<bool> nonReclaimableSection_{false};
+  // Owns the writer-behavior factory that assembles logical writer stacks.
+  std::unique_ptr<LogicalWriterFactory> logicalWriterFactory_;
+  // Owns the routing strategy responsible for mapping rows to logical writers.
+  std::unique_ptr<PartitionWriter> partitionWriter_;
 
-  // The map from writer id to the writer index in 'writers_' and 'writerInfo_'.
-  folly::F14FastMap<HiveWriterId, uint32_t, HiveWriterIdHasher, HiveWriterIdEq>
-      writerIndexMap_;
-
-  // Below are structures for partitions from all inputs. writerInfo_ and
-  // writers_ are both indexed by partitionId.
-  std::vector<std::shared_ptr<HiveWriterInfo>> writerInfo_;
-  std::vector<std::unique_ptr<dwio::common::Writer>> writers_;
-
-  // Below are structures updated when processing current input. partitionIds_
-  // are indexed by the row of input_. partitionRows_, rawPartitionRows_ and
-  // partitionSizes_ are indexed by partitionId.
+  // Stores the partition id for each row in the current input batch.
   raw_vector<uint64_t> partitionIds_;
-  std::vector<BufferPtr> partitionRows_;
-  std::vector<vector_size_t*> rawPartitionRows_;
-  std::vector<vector_size_t> partitionSizes_;
 
-  // Reusable buffers for bucket id calculations.
+  // Stores the bucket id for each row in the current input batch.
   std::vector<uint32_t> bucketIds_;
-
-  // Strategy for naming writer files
-  std::shared_ptr<const FileNameGenerator> fileNameGenerator_;
 };
 
 FOLLY_ALWAYS_INLINE std::ostream& operator<<(

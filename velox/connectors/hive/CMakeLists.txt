@@ -29,10 +29,14 @@ velox_add_library(
   HiveConnectorSplit.cpp
   HiveDataSink.cpp
   HiveDataSource.cpp
+  LogicalWriterFactory.cpp
+  WriterInfo.cpp
   FileIndexReader.cpp
   HiveIndexSource.cpp
   HivePartitionName.cpp
+  PartitionWriter.cpp
   PartitionIdGenerator.cpp
+  RotationWriter.cpp
   SplitReader.cpp
   TableHandle.cpp
 )
